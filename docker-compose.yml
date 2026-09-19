@@ -1,0 +1,86 @@
+# 路灯故障登记系统 - 一键启动
+#
+#   docker compose up -d --build
+#
+# 默认使用 sqlite (纯 Go 驱动, 无需额外数据库), 数据落在命名卷 streetlight-data。
+# 需要 PostgreSQL 时启用 postgres profile, 并把后端切到 postgres 驱动:
+#
+#   $env:DB_DRIVER = "postgres"
+#   $env:DB_DSN    = "host=postgres user=streetlight password=streetlight dbname=streetlight port=5432 sslmode=disable TimeZone=Asia/Shanghai"
+#   docker compose --profile postgres up -d --build
+name: streetlight
+
+services:
+  backend:
+    build:
+      context: ./backend
+    image: streetlight-backend:latest
+    container_name: streetlight-backend
+    environment:
+      APP_NAME: streetlight-fault-system
+      APP_ENV: production
+      # 首次启动写入演示数据; 库中已有台账/故障数据时会自动跳过
+      APP_SEED: "true"
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8080"
+      DB_DRIVER: ${DB_DRIVER:-sqlite}
+      DB_DSN: ${DB_DSN:-/app/data/streetlight.db}
+      DB_LOG_LEVEL: warn
+      CORS_ALLOW_ORIGINS: "*"
+      TZ: Asia/Shanghai
+    volumes:
+      # sqlite 数据文件目录, 删容器不丢数据
+      - streetlight-data:/app/data
+    ports:
+      # 宿主机端口可用 BACKEND_PORT 覆盖, 避免与本机其它服务冲突
+      - "${BACKEND_PORT:-8080}:8080"
+    restart: unless-stopped
+    networks:
+      - streetlight
+
+  frontend:
+    build:
+      context: ./frontend
+    image: streetlight-frontend:latest
+    container_name: streetlight-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      # 浏览器访问 http://localhost:8081, 端口冲突时用 FRONTEND_PORT 覆盖
+      - "${FRONTEND_PORT:-8081}:80"
+    restart: unless-stopped
+    networks:
+      - streetlight
+
+  # 可选数据库, 仅当使用 --profile postgres 时启动
+  postgres:
+    image: postgres:16-alpine
+    container_name: streetlight-postgres
+    profiles:
+      - postgres
+    environment:
+      POSTGRES_USER: streetlight
+      POSTGRES_PASSWORD: streetlight
+      POSTGRES_DB: streetlight
+      TZ: Asia/Shanghai
+    volumes:
+      - streetlight-pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streetlight -d streetlight"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - streetlight
+
+volumes:
+  streetlight-data:
+  streetlight-pgdata:
+
+networks:
+  streetlight:
+    driver: bridge

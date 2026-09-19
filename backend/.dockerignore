@@ -1,0 +1,16 @@
+# 构建产物与本地数据不进入镜像
+data/
+bin/
+tmp/
+*.exe
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.local
+.git
+.gitignore
+Dockerfile
+.dockerignore
+*.md
+coverage.out

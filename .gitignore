@@ -1,0 +1,77 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+backend/data/
+*.db
+node_modules/
+dist/
+.env
+.env.local
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+tmp_*.txt
+
+# ================= 补充忽略（基线模板，保持仓库干净） =================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------- 本地数据库 / 运行期数据 ----------
+instance/
+backend/instance/
+data/
+backend/data/
+*.db
+*.db-journal
+*.sqlite3
+*.sqlite3-journal
+db.sqlite3
+db.sqlite3-journal
+
+# ---------- 环境变量 ----------
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# ---------- Node / 前端 ----------
+node_modules/
+dist/
+dist-ssr/
+.vite/
+frontend/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- 日志 / 临时文件 ----------
+*.log
+logs/
+*.tmp
+tmp_*.txt
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
