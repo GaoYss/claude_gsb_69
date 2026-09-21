@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/pkg/dbtx"
 	"streetlight/pkg/pagination"
 )
 
@@ -23,7 +24,12 @@ func NewRepository(db *gorm.DB) *Repository {
 	return &Repository{db: db}
 }
 
+// session 返回带 context 的数据库句柄; context 中存在事务时复用该事务,
+// 使故障联动的运行状态写回与故障变更处于同一事务内。
 func (r *Repository) session(ctx context.Context) *gorm.DB {
+	if tx, ok := dbtx.FromContext(ctx); ok {
+		return tx.WithContext(ctx)
+	}
 	return r.db.WithContext(ctx)
 }
 
@@ -168,7 +174,7 @@ func (r *Repository) CountByColumn(ctx context.Context, column string) (map[stri
 func (r *Repository) DistinctValues(ctx context.Context, column string) ([]string, error) {
 	values := make([]string, 0)
 	err := r.session(ctx).Model(&Lamp{}).
-		Where(column + " <> ''").
+		Where(column+" <> ''").
 		Distinct().
 		Order(column).
 		Pluck(column, &values).Error

@@ -15,7 +15,7 @@ type Module struct {
 // New 构造维修记录模块, faults 为故障模块提供的端口实现。
 func New(db *gorm.DB, faults FaultPort) *Module {
 	repository := NewRepository(db)
-	service := NewService(repository, faults)
+	service := NewService(db, repository, faults)
 	return &Module{
 		repository: repository,
 		service:    service,

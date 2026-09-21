@@ -2,12 +2,14 @@ package repair
 
 import (
 	"context"
-	"log/slog"
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
+
 	"streetlight/internal/apperr"
 	"streetlight/internal/modules/fault"
+	"streetlight/pkg/dbtx"
 	"streetlight/pkg/pagination"
 )
 
@@ -30,18 +32,21 @@ type FaultPort interface {
 	GetByID(ctx context.Context, id uint) (*fault.Fault, error)
 	OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error
 	OnRepairFinished(ctx context.Context, faultID uint, fixed bool) error
-	SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error
+	// OnRepairDeleted 在删除维修记录的同一事务内回退故障的维修次数、最近一次维修、
+	// 故障状态(targetStatus), 并按剩余故障重算路灯运行状态。
+	OnRepairDeleted(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint, targetStatus string) error
 }
 
 // Service 承载维修记录录入的业务规则。
 type Service struct {
+	db     *gorm.DB
 	repo   *Repository
 	faults FaultPort
 }
 
 // NewService 构造维修记录服务。
-func NewService(repo *Repository, faults FaultPort) *Service {
-	return &Service{repo: repo, faults: faults}
+func NewService(db *gorm.DB, repo *Repository, faults FaultPort) *Service {
+	return &Service{db: db, repo: repo, faults: faults}
 }
 
 // Get 查询维修记录详情。
@@ -236,6 +241,10 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 }
 
 // Delete 删除维修记录, 已关闭故障的维修记录不允许删除。
+//
+// 删除记录与故障侧回退(维修次数、最近一次维修、故障状态)以及路灯运行状态重算
+// 在同一个数据库事务内完成: 任一步骤失败则整体回滚,
+// 不会出现记录已删除而故障与路灯字段仍停留在旧值上的中间状态。
 func (s *Service) Delete(ctx context.Context, id uint) error {
 	entity, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -249,27 +258,43 @@ func (s *Service) Delete(ctx context.Context, id uint) error {
 		return apperr.Conflict("故障 %s 已关闭, 不允许删除其维修记录", target.FaultNo)
 	}
 
-	if err := s.repo.Delete(ctx, id); err != nil {
-		return err
-	}
+	return dbtx.InTx(ctx, s.db, func(txCtx context.Context) error {
+		if err := s.repo.Delete(txCtx, id); err != nil {
+			return err
+		}
 
-	count, err := s.repo.CountByFault(ctx, entity.FaultID)
-	if err != nil {
-		return err
-	}
-	latest, err := s.repo.LatestByFault(ctx, entity.FaultID)
-	if err != nil {
-		return err
-	}
-	var latestID *uint
-	if latest != nil {
-		latestID = &latest.ID
-	}
+		count, err := s.repo.CountByFault(txCtx, entity.FaultID)
+		if err != nil {
+			return err
+		}
+		latest, err := s.repo.LatestByFault(txCtx, entity.FaultID)
+		if err != nil {
+			return err
+		}
 
-	if err := s.faults.SyncRepairStats(ctx, entity.FaultID, int(count), latestID); err != nil {
-		slog.Warn("同步故障维修统计失败", "fault_id", entity.FaultID, "error", err)
+		var latestID *uint
+		if latest != nil {
+			latestID = &latest.ID
+		}
+		targetStatus := statusAfterRepairDeleted(count, latest)
+
+		// 故障字段回退与路灯状态重算必须在同一事务内完成, 失败时由事务回滚删除动作。
+		return s.faults.OnRepairDeleted(txCtx, entity.FaultID, int(count), latestID, targetStatus)
+	})
+}
+
+// statusAfterRepairDeleted 依据删除后剩余的维修记录推算故障应回到的状态:
+// 一条维修记录都不剩时回到"待处理"(故障尚未开工);
+// 否则以最近一次维修为准——最近一次已完工且结果为已修复则回到"已修复",
+// 进行中或非已修复完工都对应"维修中"。
+func statusAfterRepairDeleted(remainingCount int64, latest *Repair) string {
+	if remainingCount == 0 || latest == nil {
+		return fault.StatusPending
 	}
-	return nil
+	if latest.Status == StatusFinished && latest.Result == ResultFixed {
+		return fault.StatusRepaired
+	}
+	return fault.StatusProcessing
 }
 
 // Metadata 返回维修模块字典。

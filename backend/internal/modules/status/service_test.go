@@ -46,7 +46,7 @@ func newHarness(t *testing.T) *harness {
 	lampService.SetOpenFaultCounter(faultRepository)
 
 	repairRepository := repair.NewRepository(db)
-	repairService := repair.NewService(repairRepository, faultService)
+	repairService := repair.NewService(db, repairRepository, faultService)
 
 	return &harness{
 		lamps:   lampService,

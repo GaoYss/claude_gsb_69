@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/pkg/dbtx"
 	"streetlight/pkg/pagination"
 )
 
@@ -37,7 +38,12 @@ func NewRepository(db *gorm.DB) *Repository {
 	return &Repository{db: db}
 }
 
+// session 返回带 context 的数据库句柄; context 中存在事务时复用该事务,
+// 使跨模块联动(删除维修记录后回退故障/路灯状态)能在同一事务内完成。
 func (r *Repository) session(ctx context.Context) *gorm.DB {
+	if tx, ok := dbtx.FromContext(ctx); ok {
+		return tx.WithContext(ctx)
+	}
 	return r.db.WithContext(ctx)
 }
 
@@ -282,7 +288,7 @@ func (r *Repository) AverageDurationHours(ctx context.Context) (float64, error) 
 func (r *Repository) DistinctValues(ctx context.Context, column string) ([]string, error) {
 	values := make([]string, 0)
 	err := r.session(ctx).Model(&Repair{}).
-		Where(column + " <> ''").
+		Where(column+" <> ''").
 		Distinct().
 		Order(column).
 		Pluck(column, &values).Error

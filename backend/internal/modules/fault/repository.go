@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/pkg/dbtx"
 	"streetlight/pkg/pagination"
 )
 
@@ -38,7 +39,12 @@ func NewRepository(db *gorm.DB) *Repository {
 	return &Repository{db: db}
 }
 
+// session 返回带 context 的数据库句柄; context 中存在事务时复用该事务,
+// 使跨模块联动(维修开工/完工/删除)对故障与路灯的写回在同一事务内完成。
 func (r *Repository) session(ctx context.Context) *gorm.DB {
+	if tx, ok := dbtx.FromContext(ctx); ok {
+		return tx.WithContext(ctx)
+	}
 	return r.db.WithContext(ctx)
 }
 

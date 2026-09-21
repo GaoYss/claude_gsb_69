@@ -283,8 +283,14 @@ func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool
 	return s.syncLampStatus(ctx, entity.LampID)
 }
 
-// SyncRepairStats 同步维修次数与最新维修记录, 删除维修记录后回退未开工状态。
-func (s *Service) SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error {
+// OnRepairDeleted 删除维修记录后在同一事务内回退故障快照, 并重算路灯运行状态。
+//
+// repairCount / latestRepairID 是删除后基于剩余维修记录重新统计的值;
+// targetStatus 是删除动作应回退到的故障状态(由维修模块依据剩余记录推算):
+// 最后一条维修被删除时回到待处理, 否则回到最近一次维修对应的维修中/已修复。
+// 删除属于纠错性回退, 允许跨越常规状态机(如 已修复 -> 待处理), 故不做 canTransitTo 校验;
+// 调用方(维修模块)已保证已关闭故障不允许删除维修记录。
+func (s *Service) OnRepairDeleted(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint, targetStatus string) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
 		return err
@@ -293,11 +299,8 @@ func (s *Service) SyncRepairStats(ctx context.Context, faultID uint, repairCount
 	columns := map[string]any{
 		"repair_count":     repairCount,
 		"latest_repair_id": latestRepairID,
+		"status":           targetStatus,
 	}
-	if repairCount == 0 && entity.Status == StatusProcessing {
-		columns["status"] = StatusPending
-	}
-
 	if err := s.repo.UpdateColumns(ctx, faultID, columns); err != nil {
 		return err
 	}
