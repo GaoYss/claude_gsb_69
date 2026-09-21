@@ -2,7 +2,6 @@ package repair
 
 import (
 	"context"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -30,7 +29,7 @@ type FaultPort interface {
 	GetByID(ctx context.Context, id uint) (*fault.Fault, error)
 	OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error
 	OnRepairFinished(ctx context.Context, faultID uint, fixed bool) error
-	SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error
+	SyncRepairStats(ctx context.Context, faultID uint, recap fault.RepairRecap) error
 }
 
 // Service 承载维修记录录入的业务规则。
@@ -235,7 +234,9 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 	return entity, nil
 }
 
-// Delete 删除维修记录, 已关闭故障的维修记录不允许删除。
+// Delete 删除维修记录, 并在同一事务内回退故障的维修次数、最近一次维修与处理状态,
+// 同时联动路灯运行状态; 已关闭故障的维修记录不允许删除。
+// 整个流程要么全部生效, 要么整体回滚, 不会出现只删了记录而统计停在旧值的情况。
 func (s *Service) Delete(ctx context.Context, id uint) error {
 	entity, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -249,27 +250,41 @@ func (s *Service) Delete(ctx context.Context, id uint) error {
 		return apperr.Conflict("故障 %s 已关闭, 不允许删除其维修记录", target.FaultNo)
 	}
 
-	if err := s.repo.Delete(ctx, id); err != nil {
-		return err
-	}
+	return s.repo.Transaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.Delete(txCtx, id); err != nil {
+			return err
+		}
+		remaining, err := s.repo.ListByFault(txCtx, entity.FaultID)
+		if err != nil {
+			return err
+		}
+		return s.faults.SyncRepairStats(txCtx, entity.FaultID, buildRepairRecap(remaining))
+	})
+}
 
-	count, err := s.repo.CountByFault(ctx, entity.FaultID)
-	if err != nil {
-		return err
+// buildRepairRecap 统计故障剩余维修记录的概况, 供故障模块回推处理状态。
+// repairs 按开工时间正序排列, 因此最后一条即最近一次维修。
+func buildRepairRecap(repairs []Repair) fault.RepairRecap {
+	recap := fault.RepairRecap{Count: len(repairs)}
+	if len(repairs) == 0 {
+		return recap
 	}
-	latest, err := s.repo.LatestByFault(ctx, entity.FaultID)
-	if err != nil {
-		return err
-	}
-	var latestID *uint
-	if latest != nil {
-		latestID = &latest.ID
-	}
+	latestID := repairs[len(repairs)-1].ID
+	recap.LatestRepairID = &latestID
 
-	if err := s.faults.SyncRepairStats(ctx, entity.FaultID, int(count), latestID); err != nil {
-		slog.Warn("同步故障维修统计失败", "fault_id", entity.FaultID, "error", err)
+	latestFinished := -1
+	for index := range repairs {
+		switch repairs[index].Status {
+		case StatusOngoing:
+			recap.HasOngoing = true
+		case StatusFinished:
+			latestFinished = index
+		}
 	}
-	return nil
+	if latestFinished >= 0 {
+		recap.LatestFixed = repairs[latestFinished].Result == ResultFixed
+	}
+	return recap
 }
 
 // Metadata 返回维修模块字典。

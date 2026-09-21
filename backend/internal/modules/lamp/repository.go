@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/internal/database"
 	"streetlight/pkg/pagination"
 )
 
@@ -23,8 +24,9 @@ func NewRepository(db *gorm.DB) *Repository {
 	return &Repository{db: db}
 }
 
+// session 返回当前上下文的数据库句柄, 处于事务中时复用事务连接。
 func (r *Repository) session(ctx context.Context) *gorm.DB {
-	return r.db.WithContext(ctx)
+	return database.Session(ctx, r.db)
 }
 
 // Create 新增路灯。

@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/internal/database"
 	"streetlight/pkg/pagination"
 )
 
@@ -37,8 +38,15 @@ func NewRepository(db *gorm.DB) *Repository {
 	return &Repository{db: db}
 }
 
+// session 返回当前上下文的数据库句柄, 处于事务中时复用事务连接。
 func (r *Repository) session(ctx context.Context) *gorm.DB {
-	return r.db.WithContext(ctx)
+	return database.Session(ctx, r.db)
+}
+
+// Transaction 在同一事务内执行 fn, 故障与路灯等其它模块的仓储会通过 context 加入该事务,
+// 保证删除维修记录时的联动更新要么全部生效, 要么全部回滚。
+func (r *Repository) Transaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	return database.Transaction(ctx, r.db, fn)
 }
 
 // Create 新增维修记录。
@@ -167,32 +175,6 @@ func (r *Repository) GetOngoingByFault(ctx context.Context, faultID uint) (*Repa
 		return nil, fmt.Errorf("查询进行中的维修记录失败: %w", err)
 	}
 	return &entity, nil
-}
-
-// LatestByFault 查询某条故障最近一次维修记录, 不存在时返回 nil。
-func (r *Repository) LatestByFault(ctx context.Context, faultID uint) (*Repair, error) {
-	var entity Repair
-	err := r.session(ctx).
-		Where("fault_id = ?", faultID).
-		Order("started_at DESC, id DESC").
-		First(&entity).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("查询最新维修记录失败: %w", err)
-	}
-	return &entity, nil
-}
-
-// CountByFault 统计某条故障的维修记录数量。
-func (r *Repository) CountByFault(ctx context.Context, faultID uint) (int64, error) {
-	var count int64
-	err := r.session(ctx).Model(&Repair{}).Where("fault_id = ?", faultID).Count(&count).Error
-	if err != nil {
-		return 0, fmt.Errorf("统计故障维修记录失败: %w", err)
-	}
-	return count, nil
 }
 
 // CountByColumn 按列分组统计。

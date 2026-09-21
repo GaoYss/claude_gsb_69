@@ -283,25 +283,53 @@ func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool
 	return s.syncLampStatus(ctx, entity.LampID)
 }
 
-// SyncRepairStats 同步维修次数与最新维修记录, 删除维修记录后回退未开工状态。
-func (s *Service) SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error {
+// RepairRecap 描述删除维修记录后故障剩余维修记录的概况, 由维修模块统计后传入。
+type RepairRecap struct {
+	Count          int   // 剩余维修记录数
+	LatestRepairID *uint // 最近一次维修记录 ID, 无剩余记录时为 nil
+	HasOngoing     bool  // 是否仍存在进行中的维修
+	LatestFixed    bool  // 最近一次完工维修的结果是否为已修复
+}
+
+// SyncRepairStats 删除维修记录后同步故障的维修次数与最近一次维修, 并依据剩余记录回推故障状态。
+// 回推规则: 无剩余记录时回到待处理; 仍有进行中的维修时为维修中;
+// 最近一次完工结果为已修复时落到已修复, 否则视为仍在维修中。
+// 该回推属于删除维修记录引发的数据订正, 不受 canTransitTo 正向流转约束。
+func (s *Service) SyncRepairStats(ctx context.Context, faultID uint, recap RepairRecap) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
 		return err
 	}
 
 	columns := map[string]any{
-		"repair_count":     repairCount,
-		"latest_repair_id": latestRepairID,
+		"repair_count":     recap.Count,
+		"latest_repair_id": recap.LatestRepairID,
 	}
-	if repairCount == 0 && entity.Status == StatusProcessing {
-		columns["status"] = StatusPending
+	// 已关闭是终态, 只同步统计字段, 不再回推状态。
+	if entity.Status != StatusClosed {
+		if next := rollbackStatus(recap); next != entity.Status {
+			columns["status"] = next
+		}
 	}
 
 	if err := s.repo.UpdateColumns(ctx, faultID, columns); err != nil {
 		return err
 	}
 	return s.syncLampStatus(ctx, entity.LampID)
+}
+
+// rollbackStatus 依据删除维修记录后的剩余情况回推故障状态。
+func rollbackStatus(recap RepairRecap) string {
+	switch {
+	case recap.Count == 0:
+		return StatusPending
+	case recap.HasOngoing:
+		return StatusProcessing
+	case recap.LatestFixed:
+		return StatusRepaired
+	default:
+		return StatusProcessing
+	}
 }
 
 // syncLampStatus 依据该路灯的故障分布重新计算并写回运行状态。

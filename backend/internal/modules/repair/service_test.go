@@ -2,8 +2,10 @@ package repair_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
@@ -15,14 +17,17 @@ import (
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
+	"streetlight/internal/modules/status"
 )
 
 // harness 使用内存数据库装配真实模块, 用于验证跨模块业务流程。
 type harness struct {
-	lamps   *lamp.Service
-	faults  *fault.Service
-	repairs *repair.Service
-	db      *gorm.DB
+	lamps      *lamp.Service
+	faults     *fault.Service
+	repairs    *repair.Service
+	status     *status.Service
+	repairRepo *repair.Repository
+	db         *gorm.DB
 }
 
 func newHarness(t *testing.T) *harness {
@@ -50,7 +55,14 @@ func newHarness(t *testing.T) *harness {
 	repairRepository := repair.NewRepository(db)
 	repairService := repair.NewService(repairRepository, faultService)
 
-	return &harness{lamps: lampService, faults: faultService, repairs: repairService, db: db}
+	return &harness{
+		lamps:      lampService,
+		faults:     faultService,
+		repairs:    repairService,
+		status:     status.NewService(db, lampRepository, faultRepository, repairRepository),
+		repairRepo: repairRepository,
+		db:         db,
+	}
 }
 
 func (h *harness) createLamp(t *testing.T, code string) *lamp.Lamp {
@@ -237,4 +249,189 @@ func TestFaultValidation(t *testing.T) {
 	// 存在未闭环故障时不允许删除路灯
 	h.createFault(t, device.ID, "删除校验")
 	requireConflict(t, h.lamps.Delete(ctx, device.ID))
+}
+
+func TestRepairDeleteRestoresPendingAndStats(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-T-101")
+	entity := h.createFault(t, device.ID, "灯头烧毁")
+
+	record, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: entity.ID, Repairman: "维修工甲"})
+	require.NoError(t, err)
+
+	before, err := h.status.Overview(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), before.Repair.Total)
+	require.Equal(t, int64(1), before.Fault.ByStatus[fault.StatusProcessing])
+
+	require.NoError(t, h.repairs.Delete(ctx, record.ID))
+
+	// 删掉最后一次维修后: 故障回到待处理, 维修次数与最近一次维修一并回退
+	after, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, fault.StatusPending, after.Status)
+	require.Equal(t, 0, after.RepairCount)
+	require.Nil(t, after.LatestRepairID)
+
+	// 故障仍未闭环, 路灯应回到故障状态而不是维修中
+	deviceAfter, err := h.lamps.Get(ctx, device.ID)
+	require.NoError(t, err)
+	require.Equal(t, lamp.RunStatusFault, deviceAfter.RunStatus)
+
+	// 看板统计随删除同步变化
+	overview, err := h.status.Overview(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), overview.Repair.Total)
+	require.Equal(t, int64(1), overview.Fault.ByStatus[fault.StatusPending])
+	require.Equal(t, int64(0), overview.Fault.ByStatus[fault.StatusProcessing])
+}
+
+func TestRepairDeleteFixedRepairRestoresPending(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-T-102")
+	entity := h.createFault(t, device.ID, "驱动电源故障")
+
+	record, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: entity.ID, Repairman: "维修工乙"})
+	require.NoError(t, err)
+	finishedAt := record.StartedAt.Add(4 * time.Hour).Format("2006-01-02 15:04:05")
+	_, err = h.repairs.Finish(ctx, record.ID, repair.FinishRequest{Result: repair.ResultFixed, FinishedAt: finishedAt})
+	require.NoError(t, err)
+
+	repaired, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, fault.StatusRepaired, repaired.Status)
+
+	before, err := h.status.Overview(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), before.Repair.Total)
+	require.InDelta(t, 4.0, before.Repair.AverageDurationHr, 0.01)
+
+	require.NoError(t, h.repairs.Delete(ctx, record.ID))
+
+	// 已修复的维修记录被删除后, 故障不应停留在已修复, 而是回到待处理
+	after, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, fault.StatusPending, after.Status)
+	require.Equal(t, 0, after.RepairCount)
+	require.Nil(t, after.LatestRepairID)
+
+	deviceAfter, err := h.lamps.Get(ctx, device.ID)
+	require.NoError(t, err)
+	require.Equal(t, lamp.RunStatusFault, deviceAfter.RunStatus)
+
+	overview, err := h.status.Overview(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), overview.Repair.Total)
+	require.Equal(t, 0.0, overview.Repair.AverageDurationHr)
+}
+
+func TestRepairDeleteKeepsProcessingWithRemainingRepairs(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-T-103")
+	entity := h.createFault(t, device.ID, "电缆老化")
+
+	first, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: entity.ID, Repairman: "维修工丙"})
+	require.NoError(t, err)
+	_, err = h.repairs.Finish(ctx, first.ID, repair.FinishRequest{Result: repair.ResultPendingParts})
+	require.NoError(t, err)
+
+	second, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: entity.ID, Repairman: "维修工丙"})
+	require.NoError(t, err)
+
+	// 删掉进行中的第二次维修: 仍有未修复的完工记录, 故障保持维修中, 最近一次维修回退到第一条
+	require.NoError(t, h.repairs.Delete(ctx, second.ID))
+
+	after, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, fault.StatusProcessing, after.Status)
+	require.Equal(t, 1, after.RepairCount)
+	require.NotNil(t, after.LatestRepairID)
+	require.Equal(t, first.ID, *after.LatestRepairID)
+
+	deviceAfter, err := h.lamps.Get(ctx, device.ID)
+	require.NoError(t, err)
+	require.Equal(t, lamp.RunStatusMaintenance, deviceAfter.RunStatus)
+
+	// 再删掉最后一条: 故障回到待处理, 路灯回到故障状态
+	require.NoError(t, h.repairs.Delete(ctx, first.ID))
+
+	final, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, fault.StatusPending, final.Status)
+	require.Equal(t, 0, final.RepairCount)
+	require.Nil(t, final.LatestRepairID)
+
+	deviceFinal, err := h.lamps.Get(ctx, device.ID)
+	require.NoError(t, err)
+	require.Equal(t, lamp.RunStatusFault, deviceFinal.RunStatus)
+}
+
+func TestRepairDeleteRejectedOnClosedFault(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-T-104")
+	entity := h.createFault(t, device.ID, "修复后闭环")
+
+	record, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: entity.ID, Repairman: "维修工丁"})
+	require.NoError(t, err)
+	_, err = h.repairs.Finish(ctx, record.ID, repair.FinishRequest{Result: repair.ResultFixed})
+	require.NoError(t, err)
+	_, err = h.faults.Close(ctx, entity.ID, fault.CloseRequest{Remark: "复核通过"})
+	require.NoError(t, err)
+
+	requireConflict(t, h.repairs.Delete(ctx, record.ID))
+}
+
+// stubFaultPort 模拟故障联动失败的端口, 用于验证删除流程的事务回滚。
+type stubFaultPort struct {
+	entity  *fault.Fault
+	syncErr error
+}
+
+func (s stubFaultPort) GetByID(ctx context.Context, id uint) (*fault.Fault, error) {
+	return s.entity, nil
+}
+
+func (s stubFaultPort) OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error {
+	return nil
+}
+
+func (s stubFaultPort) OnRepairFinished(ctx context.Context, faultID uint, fixed bool) error {
+	return nil
+}
+
+func (s stubFaultPort) SyncRepairStats(ctx context.Context, faultID uint, recap fault.RepairRecap) error {
+	return s.syncErr
+}
+
+func TestRepairDeleteRollsBackWhenSyncFails(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-T-105")
+	entity := h.createFault(t, device.ID, "同步失败应整体回滚")
+
+	record, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: entity.ID, Repairman: "维修工戊"})
+	require.NoError(t, err)
+
+	fresh, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	broken := repair.NewService(h.repairRepo, stubFaultPort{entity: fresh, syncErr: errors.New("模拟同步失败")})
+
+	err = broken.Delete(ctx, record.ID)
+	require.Error(t, err, "联动失败时删除应返回错误")
+
+	// 删除必须整体回滚: 维修记录仍在, 故障统计保持旧值
+	kept, err := h.repairs.Get(ctx, record.ID)
+	require.NoError(t, err)
+	require.Equal(t, record.RepairNo, kept.RepairNo)
+
+	unchanged, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, fault.StatusProcessing, unchanged.Status)
+	require.Equal(t, 1, unchanged.RepairCount)
+	require.NotNil(t, unchanged.LatestRepairID)
+	require.Equal(t, record.ID, *unchanged.LatestRepairID)
 }
